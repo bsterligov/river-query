@@ -2,3 +2,6 @@ target
 
 bin
 obj
+
+.release-env
+lcov.info
