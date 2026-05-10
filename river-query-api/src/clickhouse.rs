@@ -15,6 +15,20 @@ pub struct LogRow {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SpanEvent {
+    pub name: String,
+    pub timestamp: String,
+    pub attributes: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SpanLink {
+    pub trace_id: String,
+    pub span_id: String,
+    pub attributes: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct Span {
     pub span_id: String,
     pub parent_span_id: String,
@@ -24,6 +38,8 @@ pub struct Span {
     pub end_time: String,
     pub duration_ms: f64,
     pub status_code: i64,
+    pub events: Vec<SpanEvent>,
+    pub links: Vec<SpanLink>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -109,7 +125,13 @@ impl Reader {
 
         let sql = format!(
             "SELECT trace_id, span_id, parent_span_id, service_name, operation_name, \
-             start_time_unix_nano, end_time_unix_nano, duration_ns, status_code \
+             toUnixTimestamp64Nano(start_time_unix_nano) AS start_time_unix_nano, \
+             toUnixTimestamp64Nano(end_time_unix_nano) AS end_time_unix_nano, \
+             duration_ns, status_code, \
+             `Events.Name`, \
+             arrayMap(t -> toUnixTimestamp64Nano(t), `Events.Timestamp`) AS `Events.Timestamp`, \
+             `Events.Attributes`, \
+             `Links.TraceId`, `Links.SpanId`, `Links.Attributes` \
              FROM traces{where_clause} \
              ORDER BY start_time_unix_nano DESC \
              LIMIT {limit} \
@@ -123,6 +145,44 @@ impl Reader {
         for row in rows {
             let trace_id = row["trace_id"].as_str().unwrap_or_default().to_string();
             let duration_ns = row["duration_ns"].as_u64().unwrap_or(0);
+
+            let event_names = row["Events.Name"].as_array().cloned().unwrap_or_default();
+            let event_timestamps = row["Events.Timestamp"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let event_attributes = row["Events.Attributes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let events = event_names
+                .into_iter()
+                .zip(event_timestamps)
+                .zip(event_attributes)
+                .map(|((name, ts), attrs)| SpanEvent {
+                    name: name.as_str().unwrap_or_default().to_string(),
+                    timestamp: ns_to_rfc3339(ts.as_u64().unwrap_or(0)),
+                    attributes: attrs,
+                })
+                .collect();
+
+            let link_trace_ids = row["Links.TraceId"].as_array().cloned().unwrap_or_default();
+            let link_span_ids = row["Links.SpanId"].as_array().cloned().unwrap_or_default();
+            let link_attributes = row["Links.Attributes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let links = link_trace_ids
+                .into_iter()
+                .zip(link_span_ids)
+                .zip(link_attributes)
+                .map(|((tid, sid), attrs)| SpanLink {
+                    trace_id: tid.as_str().unwrap_or_default().to_string(),
+                    span_id: sid.as_str().unwrap_or_default().to_string(),
+                    attributes: attrs,
+                })
+                .collect();
+
             let span = Span {
                 span_id: row["span_id"].as_str().unwrap_or_default().to_string(),
                 parent_span_id: row["parent_span_id"]
@@ -138,6 +198,8 @@ impl Reader {
                 end_time: ns_to_rfc3339(row["end_time_unix_nano"].as_u64().unwrap_or(0)),
                 duration_ms: duration_ns as f64 / 1_000_000.0,
                 status_code: row["status_code"].as_i64().unwrap_or(0),
+                events,
+                links,
             };
             groups.entry(trace_id).or_default().push(span);
         }
