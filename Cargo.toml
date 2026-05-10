@@ -1,5 +1,5 @@
 [workspace]
-members = ["src/sidecar", "src/ingestion"]
+members = ["src/sidecar", "src/ingestion", "src/api"]
 resolver = "2"
 
 [workspace.lints.clippy]
