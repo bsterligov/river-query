@@ -1,4 +1,5 @@
 mod clickhouse;
+mod config;
 mod filter;
 mod victoriametrics;
 
@@ -20,35 +21,6 @@ use victoriametrics::Reader as VmReader;
 struct AppState {
     ch: ChReader,
     vm: VmReader,
-}
-
-struct Config {
-    port: u16,
-    clickhouse_url: String,
-    clickhouse_db: String,
-    clickhouse_user: String,
-    clickhouse_password: String,
-    victoriametrics_url: String,
-}
-
-impl Config {
-    fn from_env() -> Self {
-        Config {
-            port: std::env::var("RIVER_API_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8080),
-            clickhouse_url: std::env::var("CLICKHOUSE_URL")
-                .unwrap_or_else(|_| "http://clickhouse:8123".to_string()),
-            clickhouse_db: std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "river".to_string()),
-            clickhouse_user: std::env::var("CLICKHOUSE_USER")
-                .unwrap_or_else(|_| "river".to_string()),
-            clickhouse_password: std::env::var("CLICKHOUSE_PASSWORD")
-                .unwrap_or_else(|_| "river".to_string()),
-            victoriametrics_url: std::env::var("VICTORIAMETRICS_URL")
-                .unwrap_or_else(|_| "http://victoriametrics:8428".to_string()),
-        }
-    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -244,23 +216,23 @@ fn build_router(state: Arc<AppState>) -> axum::Router {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cfg = Config::from_env();
+    let cfg = config::Config::from_env()?;
     let http = reqwest::Client::new();
 
     let state = Arc::new(AppState {
         ch: ChReader::new(
             http.clone(),
-            cfg.clickhouse_url,
-            cfg.clickhouse_db,
-            cfg.clickhouse_user,
-            cfg.clickhouse_password,
+            cfg.storage.clickhouse_url,
+            cfg.storage.clickhouse_db,
+            cfg.storage.clickhouse_user,
+            cfg.storage.clickhouse_password,
         ),
-        vm: VmReader::new(http, cfg.victoriametrics_url),
+        vm: VmReader::new(http, cfg.storage.victoriametrics_url),
     });
 
     let app = build_router(state);
 
-    let addr = format!("0.0.0.0:{}", cfg.port);
+    let addr = format!("0.0.0.0:{}", cfg.api_port);
     println!("river api listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

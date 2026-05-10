@@ -9,4 +9,4 @@ RUN cargo build --release --package api
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/api /usr/local/bin/api
-CMD ["api"]
+CMD [river-query-api]
