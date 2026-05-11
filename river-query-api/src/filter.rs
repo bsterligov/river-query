@@ -68,7 +68,7 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
 }
 
 fn classify_word(word: &str) -> Result<Tok, String> {
-    match word {
+    match word.to_ascii_uppercase().as_str() {
         "AND" => return Ok(Tok::And),
         "OR" => return Ok(Tok::Or),
         "NOT" => return Ok(Tok::Not),
