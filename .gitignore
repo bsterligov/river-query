@@ -6,3 +6,5 @@ obj
 .release-env
 lcov.info
 worktrees
+
+.river-index

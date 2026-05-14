@@ -118,7 +118,7 @@ impl Reader {
         for row in rows {
             let attributes = parse_attributes(&row["attributes"]);
             out.push(LogRow {
-                timestamp: ns_to_rfc3339(row["timestamp"].as_u64().unwrap_or(0)),
+                timestamp: ch_datetime64_to_rfc3339(row["timestamp"].as_str().unwrap_or_default()),
                 severity: row["severity_text"]
                     .as_str()
                     .unwrap_or_default()
@@ -153,7 +153,7 @@ impl Reader {
         };
 
         let sql = format!(
-            "SELECT toStartOfInterval(fromUnixTimestamp64Nano(timestamp), INTERVAL {step} SECOND) AS bucket, \
+            "SELECT toStartOfInterval(timestamp, INTERVAL {step} SECOND) AS bucket, \
              count() AS count \
              FROM logs{where_clause} \
              GROUP BY bucket \
@@ -390,10 +390,16 @@ fn build_where_clause(
         }
     }
     if let Some(ts) = from {
-        clauses.push(format!("{time_field} >= {}", rfc3339_to_ns(ts)?));
+        clauses.push(format!(
+            "{time_field} >= toDateTime64('{}', 9)",
+            rfc3339_to_ch(ts)?
+        ));
     }
     if let Some(ts) = to {
-        clauses.push(format!("{time_field} <= {}", rfc3339_to_ns(ts)?));
+        clauses.push(format!(
+            "{time_field} <= toDateTime64('{}', 9)",
+            rfc3339_to_ch(ts)?
+        ));
     }
 
     if clauses.is_empty() {
@@ -401,6 +407,12 @@ fn build_where_clause(
     } else {
         Ok(format!(" WHERE {}", clauses.join(" AND ")))
     }
+}
+
+fn rfc3339_to_ch(s: &str) -> Result<String> {
+    let dt = DateTime::parse_from_rfc3339(s)
+        .map_err(|e| anyhow::anyhow!("invalid RFC 3339 timestamp '{s}': {e}"))?;
+    Ok(dt.format("%Y-%m-%d %H:%M:%S%.9f").to_string())
 }
 
 fn rfc3339_to_ns(s: &str) -> Result<u64> {
@@ -415,6 +427,25 @@ fn ns_to_rfc3339(ns: u64) -> String {
     DateTime::from_timestamp(secs, nanos)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default()
+}
+
+// ClickHouse DateTime64(9) JSONEachRow format: "YYYY-MM-DD HH:MM:SS.nnnnnnnnn"
+fn ch_datetime64_to_rfc3339(s: &str) -> String {
+    // Parse "2026-05-14 17:49:11.400803100" into RFC 3339
+    let s = s.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    // Replace space separator with T and ensure timezone suffix
+    let iso = if s.contains('T') {
+        format!("{s}+00:00")
+    } else {
+        format!("{}+00:00", s.replacen(' ', "T", 1))
+    };
+    // chrono can parse "2026-05-14T17:49:11.400803100+00:00"
+    chrono::DateTime::parse_from_rfc3339(&iso)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|_| s.to_string())
 }
 
 #[cfg(test)]
@@ -454,6 +485,18 @@ mod tests {
     #[test]
     fn rfc3339_to_ns_rejects_invalid() {
         assert!(rfc3339_to_ns("not-a-date").is_err());
+    }
+
+    #[test]
+    fn ch_datetime64_parses_clickhouse_format() {
+        let s = "2026-05-14 17:49:11.400803100";
+        let rfc = ch_datetime64_to_rfc3339(s);
+        assert!(rfc.starts_with("2026-05-14T17:49:11"), "got: {rfc}");
+    }
+
+    #[test]
+    fn ch_datetime64_returns_empty_for_empty_input() {
+        assert_eq!(ch_datetime64_to_rfc3339(""), "");
     }
 
     #[tokio::test]
@@ -526,6 +569,26 @@ mod tests {
         assert_eq!(auto_step(30 * 60), 60);
         assert_eq!(auto_step(30 * 3600), 3600);
         assert_eq!(auto_step(30 * 86400), 86400);
+    }
+
+    #[test]
+    fn build_where_clause_uses_todatetime64_string_literal() {
+        let clause = build_where_clause(
+            None,
+            Some("2024-01-01T00:00:00Z"),
+            Some("2024-12-31T23:59:59Z"),
+            filter::to_clickhouse_logs,
+            "timestamp",
+        )
+        .unwrap();
+        assert!(
+            clause.contains("toDateTime64('2024-01-01"),
+            "expected string literal from clause: {clause}"
+        );
+        assert!(
+            clause.contains("toDateTime64('2024-12-31"),
+            "expected string literal to clause: {clause}"
+        );
     }
 
     #[tokio::test]
