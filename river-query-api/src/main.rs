@@ -48,6 +48,18 @@ impl IntoResponse for ApiError {
     }
 }
 
+fn parse_step(s: &str) -> Option<u64> {
+    if let Some(n) = s.strip_suffix('s') {
+        n.parse().ok()
+    } else if let Some(n) = s.strip_suffix('m') {
+        n.parse::<u64>().ok().map(|v| v * 60)
+    } else if let Some(n) = s.strip_suffix('h') {
+        n.parse::<u64>().ok().map(|v| v * 3600)
+    } else {
+        s.parse().ok()
+    }
+}
+
 fn map_backend_error(err: anyhow::Error) -> ApiError {
     let msg = err.to_string();
     if msg.contains("filter") || msg.contains("invalid RFC 3339") {
@@ -71,6 +83,21 @@ struct MetricsParams {
     from: Option<String>,
     to: Option<String>,
     step: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct HistogramParams {
+    filter: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    step: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct FacetsParams {
+    filter: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
 }
 
 #[utoipa::path(
@@ -179,6 +206,76 @@ async fn get_metrics(
 
 #[utoipa::path(
     get,
+    path = "/v1/logs/histogram",
+    params(
+        ("filter" = Option<String>, Query, description = "Filter expression"),
+        ("from" = Option<String>, Query, description = "Start time (RFC 3339)"),
+        ("to" = Option<String>, Query, description = "End time (RFC 3339)"),
+        ("step" = Option<String>, Query, description = "Bucket width (e.g. 60s, 5m); auto-selected if omitted"),
+    ),
+    responses(
+        (status = 200, description = "Log counts per time bucket", body = Vec<clickhouse::HistogramBucket>),
+        (status = 400, description = "Invalid filter, timestamp, or step", body = ErrorBody),
+        (status = 503, description = "ClickHouse unavailable", body = ErrorBody),
+    )
+)]
+async fn get_logs_histogram(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HistogramParams>,
+) -> Result<Json<Vec<clickhouse::HistogramBucket>>, ApiError> {
+    let step_secs = params
+        .step
+        .as_deref()
+        .map(|s| {
+            parse_step(s).ok_or_else(|| ApiError::BadRequest(format!("invalid step value: '{s}'")))
+        })
+        .transpose()?;
+
+    state
+        .ch
+        .query_logs_histogram(
+            params.filter.as_deref(),
+            params.from.as_deref(),
+            params.to.as_deref(),
+            step_secs,
+        )
+        .await
+        .map(Json)
+        .map_err(map_backend_error)
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/logs/facets",
+    params(
+        ("filter" = Option<String>, Query, description = "Filter expression"),
+        ("from" = Option<String>, Query, description = "Start time (RFC 3339)"),
+        ("to" = Option<String>, Query, description = "End time (RFC 3339)"),
+    ),
+    responses(
+        (status = 200, description = "Top values per facet field", body = Vec<clickhouse::FacetField>),
+        (status = 400, description = "Invalid filter or timestamp", body = ErrorBody),
+        (status = 503, description = "ClickHouse unavailable", body = ErrorBody),
+    )
+)]
+async fn get_logs_facets(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<FacetsParams>,
+) -> Result<Json<Vec<clickhouse::FacetField>>, ApiError> {
+    state
+        .ch
+        .query_logs_facets(
+            params.filter.as_deref(),
+            params.from.as_deref(),
+            params.to.as_deref(),
+        )
+        .await
+        .map(Json)
+        .map_err(map_backend_error)
+}
+
+#[utoipa::path(
+    get,
     path = "/health",
     responses(
         (status = 200, description = "Service is healthy"),
@@ -190,9 +287,19 @@ async fn get_health() -> StatusCode {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(get_logs, get_traces, get_metrics, get_health),
+    paths(
+        get_logs,
+        get_logs_histogram,
+        get_logs_facets,
+        get_traces,
+        get_metrics,
+        get_health
+    ),
     components(schemas(
         clickhouse::LogRow,
+        clickhouse::HistogramBucket,
+        clickhouse::FacetValue,
+        clickhouse::FacetField,
         clickhouse::Span,
         clickhouse::TraceGroup,
         victoriametrics::MetricPoint,
@@ -204,6 +311,8 @@ struct ApiDoc;
 fn build_router(state: Arc<AppState>) -> axum::Router {
     let (api_router, _) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(utoipa_axum::routes!(get_logs))
+        .routes(utoipa_axum::routes!(get_logs_histogram))
+        .routes(utoipa_axum::routes!(get_logs_facets))
         .routes(utoipa_axum::routes!(get_traces))
         .routes(utoipa_axum::routes!(get_metrics))
         .split_for_parts();
@@ -482,6 +591,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
+    }
+
+    // Scenario: GET /v1/logs/histogram returns buckets
+    #[tokio::test]
+    async fn get_logs_histogram_returns_200() {
+        let body = r#"{"bucket":"2024-01-01 00:00:00","count":5}"#;
+        let ch = mock_server(200, body).await;
+        let vm = mock_server(200, "").await;
+        let app = build_app(ch.uri(), vm.uri());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/logs/histogram?from=2024-01-01T00%3A00%3A00Z&to=2024-01-01T01%3A00%3A00Z")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let val = body_json(resp).await;
+        assert!(val.is_array());
+        assert_eq!(val[0]["bucket"], "2024-01-01 00:00:00");
+        assert_eq!(val[0]["count"], 5);
+    }
+
+    // Scenario: GET /v1/logs/facets returns facet fields
+    #[tokio::test]
+    async fn get_logs_facets_returns_200() {
+        let body = r#"{"value":"myapp","count":10}"#;
+        let ch = mock_server(200, body).await;
+        let vm = mock_server(200, "").await;
+        let app = build_app(ch.uri(), vm.uri());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/logs/facets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let val = body_json(resp).await;
+        assert!(val.is_array());
+        assert!(val[0]["field"].as_str().is_some());
+        assert!(val[0]["values"].is_array());
     }
 
     // Scenario: limit is capped at 1000

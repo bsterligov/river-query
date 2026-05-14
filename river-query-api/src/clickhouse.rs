@@ -12,6 +12,27 @@ pub struct LogRow {
     pub service: String,
     pub body: String,
     pub trace_id: String,
+    pub severity_number: i64,
+    pub span_id: String,
+    pub attributes: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct HistogramBucket {
+    pub bucket: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FacetValue {
+    pub value: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FacetField {
+    pub field: String,
+    pub values: Vec<FacetValue>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -84,7 +105,8 @@ impl Reader {
             build_where_clause(filter, from, to, filter::to_clickhouse_logs, "timestamp")?;
 
         let sql = format!(
-            "SELECT timestamp, severity_text, service_name, body, trace_id \
+            "SELECT timestamp, severity_text, service_name, body, trace_id, \
+             severity_number, span_id, attributes \
              FROM logs{where_clause} \
              ORDER BY timestamp DESC \
              LIMIT {limit} \
@@ -94,6 +116,7 @@ impl Reader {
         let rows = self.query_json(&sql).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
+            let attributes = parse_attributes(&row["attributes"]);
             out.push(LogRow {
                 timestamp: ns_to_rfc3339(row["timestamp"].as_u64().unwrap_or(0)),
                 severity: row["severity_text"]
@@ -103,9 +126,97 @@ impl Reader {
                 service: row["service_name"].as_str().unwrap_or_default().to_string(),
                 body: row["body"].as_str().unwrap_or_default().to_string(),
                 trace_id: row["trace_id"].as_str().unwrap_or_default().to_string(),
+                severity_number: row["severity_number"].as_i64().unwrap_or(0),
+                span_id: row["span_id"].as_str().unwrap_or_default().to_string(),
+                attributes,
             });
         }
         Ok(out)
+    }
+
+    pub async fn query_logs_histogram(
+        &self,
+        filter: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+        step_secs: Option<u64>,
+    ) -> Result<Vec<HistogramBucket>> {
+        let where_clause =
+            build_where_clause(filter, from, to, filter::to_clickhouse_logs, "timestamp")?;
+
+        let step = match step_secs {
+            Some(s) => s,
+            None => {
+                let range_secs = range_secs(from, to)?;
+                auto_step(range_secs)
+            }
+        };
+
+        let sql = format!(
+            "SELECT toStartOfInterval(fromUnixTimestamp64Nano(timestamp), INTERVAL {step} SECOND) AS bucket, \
+             count() AS count \
+             FROM logs{where_clause} \
+             GROUP BY bucket \
+             ORDER BY bucket ASC \
+             FORMAT JSONEachRow"
+        );
+
+        let rows = self.query_json(&sql).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(HistogramBucket {
+                bucket: row["bucket"].as_str().unwrap_or_default().to_string(),
+                count: row["count"].as_u64().unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn query_logs_facets(
+        &self,
+        filter: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<FacetField>> {
+        let where_clause =
+            build_where_clause(filter, from, to, filter::to_clickhouse_logs, "timestamp")?;
+
+        let fields = ["service_name", "severity_text"];
+        let mut result = Vec::new();
+
+        for field in fields {
+            let sql = format!(
+                "SELECT {field} AS value, count() AS count \
+                 FROM logs{where_clause} \
+                 GROUP BY {field} \
+                 ORDER BY count DESC \
+                 LIMIT 20 \
+                 FORMAT JSONEachRow"
+            );
+            match self.query_json(&sql).await {
+                Ok(rows) => {
+                    let values = rows
+                        .into_iter()
+                        .map(|row| FacetValue {
+                            value: row["value"].as_str().unwrap_or_default().to_string(),
+                            count: row["count"].as_u64().unwrap_or(0),
+                        })
+                        .collect();
+                    result.push(FacetField {
+                        field: field.to_string(),
+                        values,
+                    });
+                }
+                Err(_) => {
+                    result.push(FacetField {
+                        field: field.to_string(),
+                        values: vec![],
+                    });
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     pub async fn query_traces(
@@ -239,6 +350,28 @@ impl Reader {
     }
 }
 
+fn parse_attributes(val: &serde_json::Value) -> serde_json::Value {
+    if let Some(s) = val.as_str() {
+        serde_json::from_str(s).unwrap_or(serde_json::Value::Object(Default::default()))
+    } else if val.is_object() {
+        val.clone()
+    } else {
+        serde_json::Value::Object(Default::default())
+    }
+}
+
+fn auto_step(range_secs: u64) -> u64 {
+    const LADDER: &[u64] = &[60, 300, 900, 3600, 21600, 86400];
+    let target = range_secs / 30;
+    *LADDER.iter().find(|&&s| s >= target).unwrap_or(&86400)
+}
+
+fn range_secs(from: Option<&str>, to: Option<&str>) -> Result<u64> {
+    let from_ns = from.map(rfc3339_to_ns).transpose()?.unwrap_or(0);
+    let to_ns = to.map(rfc3339_to_ns).transpose()?.unwrap_or(0);
+    Ok(to_ns.saturating_sub(from_ns) / 1_000_000_000)
+}
+
 fn build_where_clause(
     filter: Option<&str>,
     from: Option<&str>,
@@ -325,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_logs_returns_rows() {
-        let body = r#"{"timestamp":1000000000,"severity_text":"INFO","service_name":"svc","body":"hello","trace_id":"abc"}"#;
+        let body = r#"{"timestamp":1000000000,"severity_text":"INFO","service_name":"svc","body":"hello","trace_id":"abc","severity_number":9,"span_id":"sp1","attributes":"{\"k\":\"v\"}"}"#;
         let server = get_server(200, body).await;
         let rows = make_reader(server.uri())
             .query_logs(None, None, None, 100)
@@ -335,6 +468,64 @@ mod tests {
         assert_eq!(rows[0].service, "svc");
         assert_eq!(rows[0].body, "hello");
         assert_eq!(rows[0].severity, "INFO");
+        assert_eq!(rows[0].severity_number, 9);
+        assert_eq!(rows[0].span_id, "sp1");
+        assert_eq!(rows[0].attributes["k"], "v");
+    }
+
+    #[tokio::test]
+    async fn query_logs_histogram_returns_buckets() {
+        let body = r#"{"bucket":"2024-01-01 00:00:00","count":5}"#;
+        let server = get_server(200, body).await;
+        let buckets = make_reader(server.uri())
+            .query_logs_histogram(
+                None,
+                Some("2024-01-01T00:00:00Z"),
+                Some("2024-01-01T01:00:00Z"),
+                Some(60),
+            )
+            .await
+            .unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].bucket, "2024-01-01 00:00:00");
+        assert_eq!(buckets[0].count, 5);
+    }
+
+    #[tokio::test]
+    async fn query_logs_histogram_auto_step() {
+        let body = "";
+        let server = get_server(200, body).await;
+        make_reader(server.uri())
+            .query_logs_histogram(
+                None,
+                Some("2024-01-01T00:00:00Z"),
+                Some("2024-01-01T01:00:00Z"),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_logs_facets_returns_fields() {
+        let body = r#"{"value":"myapp","count":10}"#;
+        let server = get_server(200, body).await;
+        let facets = make_reader(server.uri())
+            .query_logs_facets(None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(facets.len(), 2);
+        assert_eq!(facets[0].field, "service_name");
+        assert!(!facets[0].values.is_empty());
+        assert_eq!(facets[0].values[0].value, "myapp");
+        assert_eq!(facets[0].values[0].count, 10);
+    }
+
+    #[test]
+    fn auto_step_targets_30_buckets() {
+        assert_eq!(auto_step(30 * 60), 60);
+        assert_eq!(auto_step(30 * 3600), 3600);
+        assert_eq!(auto_step(30 * 86400), 86400);
     }
 
     #[tokio::test]
