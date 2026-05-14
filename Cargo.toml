@@ -1,5 +1,5 @@
 [workspace]
-members = ["src/river-config", "src/river-sidecar", "src/river-ingestion", "src/river-query-api"]
+members = ["src/river-config", "src/river-sidecar", "src/river-ingestion", "src/river-query-api", "src/river-index"]
 resolver = "2"
 
 [workspace.lints.clippy]
