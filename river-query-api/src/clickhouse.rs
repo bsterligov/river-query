@@ -162,13 +162,46 @@ impl Reader {
         );
 
         let rows = self.query_json(&sql).await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            out.push(HistogramBucket {
-                bucket: row["bucket"].as_str().unwrap_or_default().to_string(),
-                count: row["count"].as_u64().unwrap_or(0),
-            });
+
+        // Build a map from bucket label → count for gap-filling below.
+        let mut counts: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let key = row["bucket"].as_str().unwrap_or_default().to_string();
+            let count = row["count"].as_u64().unwrap_or(0);
+            counts.insert(key, count);
         }
+
+        // Generate every expected bucket from `from` to `to` and fill gaps with 0.
+        // This ensures the chart always shows the full time range, not just
+        // buckets that happen to contain at least one log.
+        let from_secs = from
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| {
+                // Align to the step boundary (floor division).
+                let ts = dt.timestamp() as u64;
+                ts - (ts % step)
+            })
+            .unwrap_or(0);
+        let to_secs = to
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp() as u64)
+            .unwrap_or(from_secs);
+
+        let mut out = Vec::new();
+        let mut t = from_secs;
+        while t <= to_secs {
+            let label = chrono::DateTime::from_timestamp(t as i64, 0)
+                .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
+            let count = counts.get(&label).copied().unwrap_or(0);
+            out.push(HistogramBucket {
+                bucket: label,
+                count,
+            });
+            t = t.saturating_add(step);
+        }
+
         Ok(out)
     }
 
@@ -529,9 +562,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(buckets.len(), 1);
+        // Gap-filling generates one bucket per 60s step from from..=to: 61 total.
+        // The bucket returned by ClickHouse (00:00:00, count=5) is merged in;
+        // all others get count=0.
+        assert_eq!(buckets.len(), 61);
         assert_eq!(buckets[0].bucket, "2024-01-01 00:00:00");
         assert_eq!(buckets[0].count, 5);
+        assert_eq!(buckets[1].count, 0);
     }
 
     #[tokio::test]
