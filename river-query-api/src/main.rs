@@ -5,7 +5,7 @@ mod victoriametrics;
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -30,6 +30,7 @@ struct ErrorBody {
 
 enum ApiError {
     BadRequest(String),
+    NotFound(String),
     ServiceUnavailable(String),
 }
 
@@ -38,6 +39,9 @@ impl IntoResponse for ApiError {
         match self {
             ApiError::BadRequest(msg) => {
                 (StatusCode::BAD_REQUEST, Json(ErrorBody { error: msg })).into_response()
+            }
+            ApiError::NotFound(msg) => {
+                (StatusCode::NOT_FOUND, Json(ErrorBody { error: msg })).into_response()
             }
             ApiError::ServiceUnavailable(msg) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -276,6 +280,35 @@ async fn get_logs_facets(
 
 #[utoipa::path(
     get,
+    path = "/v1/traces/{trace_id}",
+    params(
+        ("trace_id" = String, Path, description = "Trace ID to retrieve"),
+    ),
+    responses(
+        (status = 200, description = "All spans for the given trace ID", body = Vec<clickhouse::Span>),
+        (status = 404, description = "Trace not found", body = ErrorBody),
+        (status = 503, description = "ClickHouse unavailable", body = ErrorBody),
+    )
+)]
+async fn get_trace(
+    State(state): State<Arc<AppState>>,
+    Path(trace_id): Path<String>,
+) -> Result<Json<Vec<clickhouse::Span>>, ApiError> {
+    let spans = state
+        .ch
+        .query_trace(&trace_id)
+        .await
+        .map_err(map_backend_error)?;
+
+    if spans.is_empty() {
+        return Err(ApiError::NotFound("trace not found".to_string()));
+    }
+
+    Ok(Json(spans))
+}
+
+#[utoipa::path(
+    get,
     path = "/health",
     responses(
         (status = 200, description = "Service is healthy"),
@@ -292,6 +325,7 @@ async fn get_health() -> StatusCode {
         get_logs_histogram,
         get_logs_facets,
         get_traces,
+        get_trace,
         get_metrics,
         get_health
     ),
@@ -301,6 +335,8 @@ async fn get_health() -> StatusCode {
         clickhouse::FacetValue,
         clickhouse::FacetField,
         clickhouse::Span,
+        clickhouse::SpanEvent,
+        clickhouse::SpanLink,
         clickhouse::TraceGroup,
         victoriametrics::MetricPoint,
         ErrorBody,
@@ -314,6 +350,7 @@ fn build_router(state: Arc<AppState>) -> axum::Router {
         .routes(utoipa_axum::routes!(get_logs_histogram))
         .routes(utoipa_axum::routes!(get_logs_facets))
         .routes(utoipa_axum::routes!(get_traces))
+        .routes(utoipa_axum::routes!(get_trace))
         .routes(utoipa_axum::routes!(get_metrics))
         .split_for_parts();
     axum::Router::new()
@@ -655,5 +692,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    // Scenario: GET /v1/traces/{trace_id} returns 200 with spans for a known trace
+    #[tokio::test]
+    async fn get_trace_known_id_returns_200_with_spans() {
+        let span_json = r#"{"span_id":"s1","parent_span_id":"","service_name":"svc","operation_name":"op","start_time_unix_nano":0,"end_time_unix_nano":1000000,"duration_ns":1000000,"status_code":0}"#;
+        let ch = mock_server(200, span_json).await;
+        let vm = mock_server(200, "").await;
+        let app = build_app(ch.uri(), vm.uri());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/traces/abc123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let val = body_json(resp).await;
+        assert!(val.is_array());
+        assert_eq!(val[0]["span_id"], "s1");
+        assert_eq!(val[0]["service"], "svc");
+    }
+
+    // Scenario: GET /v1/traces/{trace_id} returns 404 when no spans found
+    #[tokio::test]
+    async fn get_trace_unknown_id_returns_404() {
+        let ch = mock_server(200, "").await;
+        let vm = mock_server(200, "").await;
+        let app = build_app(ch.uri(), vm.uri());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/traces/no-such-trace")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let val = body_json(resp).await;
+        assert_eq!(val["error"], "trace not found");
+    }
+
+    // Scenario: GET /v1/traces/{trace_id} appears in /openapi.json
+    #[tokio::test]
+    async fn openapi_includes_get_trace_path() {
+        let app = build_app(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let val = body_json(resp).await;
+        let paths = val["paths"].as_object().unwrap();
+        assert!(
+            paths.contains_key("/v1/traces/{trace_id}"),
+            "expected /v1/traces/{{trace_id}} in paths, got: {:?}",
+            paths.keys().collect::<Vec<_>>()
+        );
     }
 }

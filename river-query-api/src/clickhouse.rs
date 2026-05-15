@@ -288,63 +288,7 @@ impl Reader {
 
         for row in rows {
             let trace_id = row["trace_id"].as_str().unwrap_or_default().to_string();
-            let duration_ns = row["duration_ns"].as_u64().unwrap_or(0);
-
-            let event_names = row["Events.Name"].as_array().cloned().unwrap_or_default();
-            let event_timestamps = row["Events.Timestamp"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let event_attributes = row["Events.Attributes"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let events = event_names
-                .into_iter()
-                .zip(event_timestamps)
-                .zip(event_attributes)
-                .map(|((name, ts), attrs)| SpanEvent {
-                    name: name.as_str().unwrap_or_default().to_string(),
-                    timestamp: ns_to_rfc3339(ts.as_u64().unwrap_or(0)),
-                    attributes: attrs,
-                })
-                .collect();
-
-            let link_trace_ids = row["Links.TraceId"].as_array().cloned().unwrap_or_default();
-            let link_span_ids = row["Links.SpanId"].as_array().cloned().unwrap_or_default();
-            let link_attributes = row["Links.Attributes"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let links = link_trace_ids
-                .into_iter()
-                .zip(link_span_ids)
-                .zip(link_attributes)
-                .map(|((tid, sid), attrs)| SpanLink {
-                    trace_id: tid.as_str().unwrap_or_default().to_string(),
-                    span_id: sid.as_str().unwrap_or_default().to_string(),
-                    attributes: attrs,
-                })
-                .collect();
-
-            let span = Span {
-                span_id: row["span_id"].as_str().unwrap_or_default().to_string(),
-                parent_span_id: row["parent_span_id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-                service: row["service_name"].as_str().unwrap_or_default().to_string(),
-                operation: row["operation_name"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-                start_time: ns_to_rfc3339(row["start_time_unix_nano"].as_u64().unwrap_or(0)),
-                end_time: ns_to_rfc3339(row["end_time_unix_nano"].as_u64().unwrap_or(0)),
-                duration_ms: duration_ns as f64 / 1_000_000.0,
-                status_code: row["status_code"].as_i64().unwrap_or(0),
-                events,
-                links,
-            };
+            let span = row_to_span(&row);
             groups.entry(trace_id).or_default().push(span);
         }
 
@@ -356,6 +300,89 @@ impl Reader {
         Ok(result)
     }
 
+    pub async fn query_trace(&self, trace_id: &str) -> Result<Vec<Span>> {
+        let escaped = trace_id.replace('\'', "\\'");
+        let sql = format!(
+            "SELECT span_id, parent_span_id, service_name, operation_name, \
+             toUnixTimestamp64Nano(start_time_unix_nano) AS start_time_unix_nano, \
+             toUnixTimestamp64Nano(end_time_unix_nano) AS end_time_unix_nano, \
+             duration_ns, status_code, \
+             `Events.Name`, \
+             arrayMap(t -> toUnixTimestamp64Nano(t), `Events.Timestamp`) AS `Events.Timestamp`, \
+             `Events.Attributes`, \
+             `Links.TraceId`, `Links.SpanId`, `Links.Attributes` \
+             FROM traces \
+             WHERE trace_id = '{escaped}' \
+             ORDER BY start_time_unix_nano ASC \
+             FORMAT JSONEachRow"
+        );
+
+        let rows = self.query_json(&sql).await?;
+        Ok(rows.iter().map(row_to_span).collect())
+    }
+}
+
+fn row_to_span(row: &serde_json::Value) -> Span {
+    let duration_ns = row["duration_ns"].as_u64().unwrap_or(0);
+
+    let event_names = row["Events.Name"].as_array().cloned().unwrap_or_default();
+    let event_timestamps = row["Events.Timestamp"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let event_attributes = row["Events.Attributes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let events = event_names
+        .into_iter()
+        .zip(event_timestamps)
+        .zip(event_attributes)
+        .map(|((name, ts), attrs)| SpanEvent {
+            name: name.as_str().unwrap_or_default().to_string(),
+            timestamp: ns_to_rfc3339(ts.as_u64().unwrap_or(0)),
+            attributes: attrs,
+        })
+        .collect();
+
+    let link_trace_ids = row["Links.TraceId"].as_array().cloned().unwrap_or_default();
+    let link_span_ids = row["Links.SpanId"].as_array().cloned().unwrap_or_default();
+    let link_attributes = row["Links.Attributes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let links = link_trace_ids
+        .into_iter()
+        .zip(link_span_ids)
+        .zip(link_attributes)
+        .map(|((tid, sid), attrs)| SpanLink {
+            trace_id: tid.as_str().unwrap_or_default().to_string(),
+            span_id: sid.as_str().unwrap_or_default().to_string(),
+            attributes: attrs,
+        })
+        .collect();
+
+    Span {
+        span_id: row["span_id"].as_str().unwrap_or_default().to_string(),
+        parent_span_id: row["parent_span_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        service: row["service_name"].as_str().unwrap_or_default().to_string(),
+        operation: row["operation_name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        start_time: ns_to_rfc3339(row["start_time_unix_nano"].as_u64().unwrap_or(0)),
+        end_time: ns_to_rfc3339(row["end_time_unix_nano"].as_u64().unwrap_or(0)),
+        duration_ms: duration_ns as f64 / 1_000_000.0,
+        status_code: row["status_code"].as_i64().unwrap_or(0),
+        events,
+        links,
+    }
+}
+
+impl Reader {
     async fn query_json(&self, sql: &str) -> Result<Vec<serde_json::Value>> {
         let resp = self
             .client
@@ -699,6 +726,52 @@ mod tests {
             .await;
         make_reader(server.uri())
             .query_logs(None, None, None, 42)
+            .await
+            .unwrap();
+    }
+
+    // Scenario: query_trace returns spans for a known trace ID
+    #[tokio::test]
+    async fn query_trace_returns_spans_for_known_id() {
+        let body = concat!(
+            r#"{"span_id":"s1","parent_span_id":"","service_name":"svc","operation_name":"op","start_time_unix_nano":0,"end_time_unix_nano":1000000,"duration_ns":1000000,"status_code":0}"#,
+            "\n",
+            r#"{"span_id":"s2","parent_span_id":"s1","service_name":"svc","operation_name":"child","start_time_unix_nano":100,"end_time_unix_nano":500000,"duration_ns":499900,"status_code":0}"#,
+        );
+        let server = get_server(200, body).await;
+        let spans = make_reader(server.uri())
+            .query_trace("abc123")
+            .await
+            .unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].span_id, "s1");
+        assert_eq!(spans[0].service, "svc");
+        assert_eq!(spans[1].span_id, "s2");
+        assert_eq!(spans[1].parent_span_id, "s1");
+    }
+
+    // Scenario: query_trace returns empty Vec when ClickHouse returns no rows
+    #[tokio::test]
+    async fn query_trace_returns_empty_for_unknown_id() {
+        let server = get_server(200, "").await;
+        let spans = make_reader(server.uri())
+            .query_trace("unknown-id")
+            .await
+            .unwrap();
+        assert!(spans.is_empty());
+    }
+
+    // Scenario: query_trace sends trace_id in the SQL WHERE clause
+    #[tokio::test]
+    async fn query_trace_sends_trace_id_in_sql() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(query_param_contains("query", "trace_id = 'my-trace-id'"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .mount(&server)
+            .await;
+        make_reader(server.uri())
+            .query_trace("my-trace-id")
             .await
             .unwrap();
     }
