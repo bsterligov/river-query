@@ -276,9 +276,7 @@ impl Reader {
              arrayMap(t -> toUnixTimestamp64Nano(t), `Events.Timestamp`) AS `Events.Timestamp`, \
              `Events.Attributes`, \
              `Links.TraceId`, `Links.SpanId`, `Links.Attributes` \
-             FROM traces{where_clause} \
-             ORDER BY start_time_unix_nano DESC \
-             LIMIT {limit} \
+             FROM (SELECT * FROM traces{where_clause} ORDER BY start_time_unix_nano DESC LIMIT {limit}) \
              FORMAT JSONEachRow"
         );
 
