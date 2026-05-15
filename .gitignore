@@ -8,3 +8,4 @@ lcov.info
 worktrees
 
 .river-index
+*.lscache
