@@ -9,3 +9,5 @@ worktrees
 
 .river-index
 *.lscache
+
+.env.local
