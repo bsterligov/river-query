@@ -59,6 +59,7 @@ pub struct Span {
     pub end_time: String,
     pub duration_ms: f64,
     pub status_code: i64,
+    pub attributes: serde_json::Value,
     pub events: Vec<SpanEvent>,
     pub links: Vec<SpanLink>,
 }
@@ -271,7 +272,7 @@ impl Reader {
             "SELECT trace_id, span_id, parent_span_id, service_name, operation_name, \
              toUnixTimestamp64Nano(start_time_unix_nano) AS start_time_unix_nano, \
              toUnixTimestamp64Nano(end_time_unix_nano) AS end_time_unix_nano, \
-             duration_ns, status_code, \
+             duration_ns, status_code, attributes, \
              `Events.Name`, \
              arrayMap(t -> toUnixTimestamp64Nano(t), `Events.Timestamp`) AS `Events.Timestamp`, \
              `Events.Attributes`, \
@@ -304,7 +305,7 @@ impl Reader {
             "SELECT span_id, parent_span_id, service_name, operation_name, \
              toUnixTimestamp64Nano(start_time_unix_nano) AS start_time_unix_nano, \
              toUnixTimestamp64Nano(end_time_unix_nano) AS end_time_unix_nano, \
-             duration_ns, status_code, \
+             duration_ns, status_code, attributes, \
              `Events.Name`, \
              arrayMap(t -> toUnixTimestamp64Nano(t), `Events.Timestamp`) AS `Events.Timestamp`, \
              `Events.Attributes`, \
@@ -375,6 +376,7 @@ fn row_to_span(row: &serde_json::Value) -> Span {
         end_time: ns_to_rfc3339(row["end_time_unix_nano"].as_u64().unwrap_or(0)),
         duration_ms: duration_ns as f64 / 1_000_000.0,
         status_code: row["status_code"].as_i64().unwrap_or(0),
+        attributes: parse_attributes(&row["attributes"]),
         events,
         links,
     }
@@ -772,5 +774,54 @@ mod tests {
             .query_trace("my-trace-id")
             .await
             .unwrap();
+    }
+
+    // Scenario: span with non-empty SpanAttributes map returns key-value pairs in `attributes`
+    #[tokio::test]
+    async fn query_trace_span_with_attributes_returns_key_value_pairs() {
+        let body = r#"{"span_id":"s1","parent_span_id":"","service_name":"svc","operation_name":"op","start_time_unix_nano":0,"end_time_unix_nano":1000000,"duration_ns":1000000,"status_code":0,"attributes":"{\"http.method\":\"GET\",\"http.status_code\":\"200\"}"}"#;
+        let server = get_server(200, body).await;
+        let spans = make_reader(server.uri()).query_trace("t1").await.unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].attributes["http.method"], "GET");
+        assert_eq!(spans[0].attributes["http.status_code"], "200");
+    }
+
+    // Scenario: span with no attributes returns an empty JSON object `{}`
+    #[tokio::test]
+    async fn query_trace_span_with_no_attributes_returns_empty_object() {
+        let body = r#"{"span_id":"s1","parent_span_id":"","service_name":"svc","operation_name":"op","start_time_unix_nano":0,"end_time_unix_nano":1000000,"duration_ns":1000000,"status_code":0}"#;
+        let server = get_server(200, body).await;
+        let spans = make_reader(server.uri()).query_trace("t1").await.unwrap();
+        assert_eq!(spans.len(), 1);
+        assert!(
+            spans[0].attributes.is_object(),
+            "expected object, got: {}",
+            spans[0].attributes
+        );
+        assert_eq!(spans[0].attributes.as_object().unwrap().len(), 0);
+    }
+
+    // Scenario: span with malformed attributes JSON falls back to empty object
+    #[tokio::test]
+    async fn query_trace_span_with_malformed_attributes_falls_back_to_empty_object() {
+        let body = r#"{"span_id":"s1","parent_span_id":"","service_name":"svc","operation_name":"op","start_time_unix_nano":0,"end_time_unix_nano":1000000,"duration_ns":1000000,"status_code":0,"attributes":"not-valid-json"}"#;
+        let server = get_server(200, body).await;
+        let spans = make_reader(server.uri()).query_trace("t1").await.unwrap();
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].attributes.is_object());
+        assert_eq!(spans[0].attributes.as_object().unwrap().len(), 0);
+    }
+
+    // Scenario: query_trace SQL includes `attributes` column
+    #[tokio::test]
+    async fn query_trace_sql_includes_attributes_column() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(query_param_contains("query", "attributes"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .mount(&server)
+            .await;
+        make_reader(server.uri()).query_trace("t1").await.unwrap();
     }
 }
