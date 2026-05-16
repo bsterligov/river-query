@@ -11,3 +11,5 @@ worktrees
 *.lscache
 
 .env.local
+
+.scannerwork
