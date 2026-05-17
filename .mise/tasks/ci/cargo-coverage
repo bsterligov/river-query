@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Run tests and generate lcov.info"
+
+cargo llvm-cov --workspace --no-cfg-coverage --lcov --output-path lcov.info \
+  --ignore-filename-regex 'main\.rs'

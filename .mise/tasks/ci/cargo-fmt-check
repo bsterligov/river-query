@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+#MISE description="Check formatting"
+
+cargo fmt -- --check
