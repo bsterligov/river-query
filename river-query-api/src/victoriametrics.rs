@@ -20,6 +20,26 @@ impl Reader {
         Reader { client, base_url }
     }
 
+    pub async fn list_metric_names(&self) -> Result<Vec<String>> {
+        let url = format!("{}/api/v1/label/__name__/values", self.base_url);
+        let resp = self.client.get(&url).send().await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("victoriametrics label values failed status={status}: {body}");
+        }
+
+        let body: serde_json::Value = resp.json().await?;
+        let names = body["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        Ok(names)
+    }
+
     pub async fn query_metrics(
         &self,
         filter: &str,

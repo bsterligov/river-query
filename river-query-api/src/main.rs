@@ -210,6 +210,25 @@ async fn get_metrics(
 
 #[utoipa::path(
     get,
+    path = "/v1/metrics/names",
+    responses(
+        (status = 200, description = "List of metric names", body = Vec<String>),
+        (status = 503, description = "VictoriaMetrics unavailable", body = ErrorBody),
+    )
+)]
+async fn get_metric_names(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    state
+        .vm
+        .list_metric_names()
+        .await
+        .map(Json)
+        .map_err(map_backend_error)
+}
+
+#[utoipa::path(
+    get,
     path = "/v1/logs/histogram",
     params(
         ("filter" = Option<String>, Query, description = "Filter expression"),
@@ -327,6 +346,7 @@ async fn get_health() -> StatusCode {
         get_traces,
         get_trace,
         get_metrics,
+        get_metric_names,
         get_health
     ),
     components(schemas(
@@ -352,6 +372,7 @@ fn build_router(state: Arc<AppState>) -> axum::Router {
         .routes(utoipa_axum::routes!(get_traces))
         .routes(utoipa_axum::routes!(get_trace))
         .routes(utoipa_axum::routes!(get_metrics))
+        .routes(utoipa_axum::routes!(get_metric_names))
         .split_for_parts();
     axum::Router::new()
         .merge(api_router)
@@ -628,6 +649,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
+    }
+
+    // Scenario: GET /v1/metrics/names returns list of metric names
+    #[tokio::test]
+    async fn get_metric_names_returns_names() {
+        let body = r#"{"status":"success","data":["http_requests_total","go_goroutines"]}"#;
+        let ch = mock_server(200, "").await;
+        let vm = mock_server(200, body).await;
+        let app = build_app(ch.uri(), vm.uri());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/metrics/names")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let names = body_json(resp).await;
+        assert!(names.is_array());
+        assert_eq!(names.as_array().unwrap().len(), 2);
     }
 
     // Scenario: GET /v1/logs/histogram returns buckets
