@@ -1,9 +1,11 @@
 use anyhow::{bail, Result};
 use chrono::DateTime;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::filter;
+
+// --- Public output DTOs ---
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct LogRow {
@@ -70,6 +72,153 @@ pub struct TraceGroup {
     pub spans: Vec<Span>,
 }
 
+// --- Private typed ClickHouse row structs ---
+
+#[derive(Debug, Deserialize)]
+struct ChLogRow {
+    // ClickHouse DateTime64 arrives as "YYYY-MM-DD HH:MM:SS.nnn" string in real
+    // responses; some test fixtures use an integer epoch — accept both.
+    timestamp: serde_json::Value,
+    #[serde(default)]
+    severity_text: String,
+    #[serde(default)]
+    service_name: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    trace_id: String,
+    #[serde(default)]
+    severity_number: i64,
+    #[serde(default)]
+    span_id: String,
+    #[serde(default)]
+    attributes: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChHistogramRow {
+    bucket: String,
+    count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChFacetValueRow {
+    value: String,
+    count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChSpanRow {
+    #[serde(default)]
+    trace_id: Option<String>,
+    span_id: String,
+    parent_span_id: String,
+    service_name: String,
+    operation_name: String,
+    start_time_unix_nano: u64,
+    end_time_unix_nano: u64,
+    duration_ns: u64,
+    status_code: i64,
+    #[serde(default)]
+    attributes: serde_json::Value,
+    #[serde(rename = "Events.Name", default)]
+    events_name: Vec<serde_json::Value>,
+    #[serde(rename = "Events.Timestamp", default)]
+    events_timestamp: Vec<serde_json::Value>,
+    #[serde(rename = "Events.Attributes", default)]
+    events_attributes: Vec<serde_json::Value>,
+    #[serde(rename = "Links.TraceId", default)]
+    links_trace_id: Vec<serde_json::Value>,
+    #[serde(rename = "Links.SpanId", default)]
+    links_span_id: Vec<serde_json::Value>,
+    #[serde(rename = "Links.Attributes", default)]
+    links_attributes: Vec<serde_json::Value>,
+}
+
+// --- Conversions from CH row structs to output DTOs ---
+
+impl From<ChLogRow> for LogRow {
+    fn from(row: ChLogRow) -> Self {
+        let timestamp = match &row.timestamp {
+            serde_json::Value::String(s) => ch_datetime64_to_rfc3339(s),
+            serde_json::Value::Number(n) => ns_to_rfc3339(n.as_u64().unwrap_or(0)),
+            _ => String::new(),
+        };
+        LogRow {
+            timestamp,
+            severity: row.severity_text,
+            service: row.service_name,
+            body: row.body,
+            trace_id: row.trace_id,
+            severity_number: row.severity_number,
+            span_id: row.span_id,
+            attributes: parse_attributes(&row.attributes),
+        }
+    }
+}
+
+impl From<ChHistogramRow> for HistogramBucket {
+    fn from(row: ChHistogramRow) -> Self {
+        HistogramBucket {
+            bucket: row.bucket,
+            count: row.count,
+        }
+    }
+}
+
+impl From<ChFacetValueRow> for FacetValue {
+    fn from(row: ChFacetValueRow) -> Self {
+        FacetValue {
+            value: row.value,
+            count: row.count,
+        }
+    }
+}
+
+impl From<ChSpanRow> for Span {
+    fn from(row: ChSpanRow) -> Self {
+        let events = row
+            .events_name
+            .into_iter()
+            .zip(row.events_timestamp)
+            .zip(row.events_attributes)
+            .map(|((name, ts), attrs)| SpanEvent {
+                name: name.as_str().unwrap_or_default().to_string(),
+                timestamp: ns_to_rfc3339(ts.as_u64().unwrap_or(0)),
+                attributes: attrs,
+            })
+            .collect();
+
+        let links = row
+            .links_trace_id
+            .into_iter()
+            .zip(row.links_span_id)
+            .zip(row.links_attributes)
+            .map(|((tid, sid), attrs)| SpanLink {
+                trace_id: tid.as_str().unwrap_or_default().to_string(),
+                span_id: sid.as_str().unwrap_or_default().to_string(),
+                attributes: attrs,
+            })
+            .collect();
+
+        Span {
+            span_id: row.span_id,
+            parent_span_id: row.parent_span_id,
+            service: row.service_name,
+            operation: row.operation_name,
+            start_time: ns_to_rfc3339(row.start_time_unix_nano),
+            end_time: ns_to_rfc3339(row.end_time_unix_nano),
+            duration_ms: row.duration_ns as f64 / 1_000_000.0,
+            status_code: row.status_code,
+            attributes: parse_attributes(&row.attributes),
+            events,
+            links,
+        }
+    }
+}
+
+// --- Reader ---
+
 pub struct Reader {
     client: reqwest::Client,
     base_url: String,
@@ -114,25 +263,8 @@ impl Reader {
              FORMAT JSONEachRow"
         );
 
-        let rows = self.query_json(&sql).await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let attributes = parse_attributes(&row["attributes"]);
-            out.push(LogRow {
-                timestamp: ch_datetime64_to_rfc3339(row["timestamp"].as_str().unwrap_or_default()),
-                severity: row["severity_text"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-                service: row["service_name"].as_str().unwrap_or_default().to_string(),
-                body: row["body"].as_str().unwrap_or_default().to_string(),
-                trace_id: row["trace_id"].as_str().unwrap_or_default().to_string(),
-                severity_number: row["severity_number"].as_i64().unwrap_or(0),
-                span_id: row["span_id"].as_str().unwrap_or_default().to_string(),
-                attributes,
-            });
-        }
-        Ok(out)
+        let rows: Vec<ChLogRow> = self.query_typed(&sql).await?;
+        Ok(rows.into_iter().map(LogRow::from).collect())
     }
 
     pub async fn query_logs_histogram(
@@ -162,15 +294,13 @@ impl Reader {
              FORMAT JSONEachRow"
         );
 
-        let rows = self.query_json(&sql).await?;
+        let rows: Vec<ChHistogramRow> = self.query_typed(&sql).await?;
 
         // Build a map from bucket label → count for gap-filling below.
         let mut counts: std::collections::HashMap<String, u64> =
             std::collections::HashMap::with_capacity(rows.len());
         for row in &rows {
-            let key = row["bucket"].as_str().unwrap_or_default().to_string();
-            let count = row["count"].as_u64().unwrap_or(0);
-            counts.insert(key, count);
+            counts.insert(row.bucket.clone(), row.count);
         }
 
         // Generate every expected bucket from `from` to `to` and fill gaps with 0.
@@ -227,18 +357,11 @@ impl Reader {
                  LIMIT 20 \
                  FORMAT JSONEachRow"
             );
-            match self.query_json(&sql).await {
+            match self.query_typed::<ChFacetValueRow>(&sql).await {
                 Ok(rows) => {
-                    let values = rows
-                        .into_iter()
-                        .map(|row| FacetValue {
-                            value: row["value"].as_str().unwrap_or_default().to_string(),
-                            count: row["count"].as_u64().unwrap_or(0),
-                        })
-                        .collect();
                     result.push(FacetField {
                         field: field.to_string(),
-                        values,
+                        values: rows.into_iter().map(FacetValue::from).collect(),
                     });
                 }
                 Err(_) => {
@@ -281,14 +404,13 @@ impl Reader {
              FORMAT JSONEachRow"
         );
 
-        let rows = self.query_json(&sql).await?;
+        let rows: Vec<ChSpanRow> = self.query_typed(&sql).await?;
         let mut groups: std::collections::HashMap<String, Vec<Span>> =
             std::collections::HashMap::new();
 
         for row in rows {
-            let trace_id = row["trace_id"].as_str().unwrap_or_default().to_string();
-            let span = row_to_span(&row);
-            groups.entry(trace_id).or_default().push(span);
+            let trace_id = row.trace_id.clone().unwrap_or_default();
+            groups.entry(trace_id).or_default().push(Span::from(row));
         }
 
         let mut result: Vec<TraceGroup> = groups
@@ -316,77 +438,11 @@ impl Reader {
              FORMAT JSONEachRow"
         );
 
-        let rows = self.query_json(&sql).await?;
-        Ok(rows.iter().map(row_to_span).collect())
+        let rows: Vec<ChSpanRow> = self.query_typed(&sql).await?;
+        Ok(rows.into_iter().map(Span::from).collect())
     }
-}
 
-fn build_events(row: &serde_json::Value) -> Vec<SpanEvent> {
-    let names = row["Events.Name"].as_array().cloned().unwrap_or_default();
-    let timestamps = row["Events.Timestamp"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let attributes = row["Events.Attributes"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    names
-        .into_iter()
-        .zip(timestamps)
-        .zip(attributes)
-        .map(|((name, ts), attrs)| SpanEvent {
-            name: name.as_str().unwrap_or_default().to_string(),
-            timestamp: ns_to_rfc3339(ts.as_u64().unwrap_or(0)),
-            attributes: attrs,
-        })
-        .collect()
-}
-
-fn build_links(row: &serde_json::Value) -> Vec<SpanLink> {
-    let trace_ids = row["Links.TraceId"].as_array().cloned().unwrap_or_default();
-    let span_ids = row["Links.SpanId"].as_array().cloned().unwrap_or_default();
-    let attributes = row["Links.Attributes"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    trace_ids
-        .into_iter()
-        .zip(span_ids)
-        .zip(attributes)
-        .map(|((tid, sid), attrs)| SpanLink {
-            trace_id: tid.as_str().unwrap_or_default().to_string(),
-            span_id: sid.as_str().unwrap_or_default().to_string(),
-            attributes: attrs,
-        })
-        .collect()
-}
-
-fn row_to_span(row: &serde_json::Value) -> Span {
-    let duration_ns = row["duration_ns"].as_u64().unwrap_or(0);
-    Span {
-        span_id: row["span_id"].as_str().unwrap_or_default().to_string(),
-        parent_span_id: row["parent_span_id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
-        service: row["service_name"].as_str().unwrap_or_default().to_string(),
-        operation: row["operation_name"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
-        start_time: ns_to_rfc3339(row["start_time_unix_nano"].as_u64().unwrap_or(0)),
-        end_time: ns_to_rfc3339(row["end_time_unix_nano"].as_u64().unwrap_or(0)),
-        duration_ms: duration_ns as f64 / 1_000_000.0,
-        status_code: row["status_code"].as_i64().unwrap_or(0),
-        attributes: parse_attributes(&row["attributes"]),
-        events: build_events(row),
-        links: build_links(row),
-    }
-}
-
-impl Reader {
-    async fn query_json(&self, sql: &str) -> Result<Vec<serde_json::Value>> {
+    async fn query_typed<T: DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>> {
         let resp = self
             .client
             .get(&self.base_url)
@@ -830,5 +886,74 @@ mod tests {
             .mount(&server)
             .await;
         make_reader(server.uri()).query_trace("t1").await.unwrap();
+    }
+
+    // Scenario: ChLogRow with string timestamp (ClickHouse DateTime64 format) converts correctly
+    #[tokio::test]
+    async fn query_logs_string_timestamp_converts_to_rfc3339() {
+        let body = r#"{"timestamp":"2026-05-14 17:49:11.400803100","severity_text":"INFO","service_name":"svc","body":"hello","trace_id":"","severity_number":9,"span_id":"","attributes":{}}"#;
+        let server = get_server(200, body).await;
+        let rows = make_reader(server.uri())
+            .query_logs(None, None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].timestamp.starts_with("2026-05-14T17:49:11"),
+            "expected RFC3339, got: {}",
+            rows[0].timestamp
+        );
+    }
+
+    // Scenario: ChLogRow with null/unexpected timestamp type produces empty string
+    #[tokio::test]
+    async fn query_logs_null_timestamp_produces_empty_string() {
+        let body = r#"{"timestamp":null,"severity_text":"INFO","service_name":"svc","body":"hi","trace_id":"","severity_number":0,"span_id":"","attributes":{}}"#;
+        let server = get_server(200, body).await;
+        let rows = make_reader(server.uri())
+            .query_logs(None, None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].timestamp, "");
+    }
+
+    // Scenario: histogram From converts bucket/count fields correctly
+    #[test]
+    fn histogram_from_ch_row_maps_fields() {
+        let row = super::ChHistogramRow {
+            bucket: "2024-01-01 00:00:00".to_string(),
+            count: 42,
+        };
+        let bucket = HistogramBucket::from(row);
+        assert_eq!(bucket.bucket, "2024-01-01 00:00:00");
+        assert_eq!(bucket.count, 42);
+    }
+
+    // Scenario: span with events and links populates those fields
+    #[tokio::test]
+    async fn query_trace_span_with_events_and_links() {
+        let body = r#"{"span_id":"s1","parent_span_id":"","service_name":"svc","operation_name":"op","start_time_unix_nano":0,"end_time_unix_nano":1000000,"duration_ns":1000000,"status_code":0,"Events.Name":["evt"],"Events.Timestamp":[500000],"Events.Attributes":[{"k":"v"}],"Links.TraceId":["lt1"],"Links.SpanId":["ls1"],"Links.Attributes":[{}]}"#;
+        let server = get_server(200, body).await;
+        let spans = make_reader(server.uri()).query_trace("t1").await.unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].events.len(), 1);
+        assert_eq!(spans[0].events[0].name, "evt");
+        assert_eq!(spans[0].links.len(), 1);
+        assert_eq!(spans[0].links[0].trace_id, "lt1");
+        assert_eq!(spans[0].links[0].span_id, "ls1");
+    }
+
+    // Scenario: facets query error on one field still returns empty values (not a hard error)
+    #[tokio::test]
+    async fn query_logs_facets_ch_error_returns_empty_values() {
+        let server = get_server(500, "DB error").await;
+        let facets = make_reader(server.uri())
+            .query_logs_facets(None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(facets.len(), 2);
+        assert!(facets[0].values.is_empty());
+        assert!(facets[1].values.is_empty());
     }
 }
