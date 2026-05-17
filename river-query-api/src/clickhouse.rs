@@ -401,7 +401,10 @@ impl Reader {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("(error reading response body: {e})"));
             bail!("clickhouse query failed status={status}: {body}");
         }
 
@@ -490,7 +493,7 @@ fn ns_to_rfc3339(ns: u64) -> String {
     let nanos = (ns % 1_000_000_000) as u32;
     DateTime::from_timestamp(secs, nanos)
         .map(|dt| dt.to_rfc3339())
-        .unwrap_or_default()
+        .unwrap_or_else(|| format!("(invalid timestamp ns={ns})"))
 }
 
 // ClickHouse DateTime64(9) JSONEachRow format: "YYYY-MM-DD HH:MM:SS.nnnnnnnnn"

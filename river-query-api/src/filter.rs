@@ -87,17 +87,17 @@ fn classify_word(word: &str) -> Result<Tok, String> {
     }
 }
 
-fn parse_op_value(s: &str) -> Result<(Op, String), String> {
-    if let Some(rest) = s.strip_prefix(">=") {
+fn parse_op_value(input: &str) -> Result<(Op, String), String> {
+    if let Some(rest) = input.strip_prefix(">=") {
         Ok((Op::Gte, rest.to_string()))
-    } else if let Some(rest) = s.strip_prefix("<=") {
+    } else if let Some(rest) = input.strip_prefix("<=") {
         Ok((Op::Lte, rest.to_string()))
-    } else if let Some(rest) = s.strip_prefix('>') {
+    } else if let Some(rest) = input.strip_prefix('>') {
         Ok((Op::Gt, rest.to_string()))
-    } else if let Some(rest) = s.strip_prefix('<') {
+    } else if let Some(rest) = input.strip_prefix('<') {
         Ok((Op::Lt, rest.to_string()))
     } else {
-        Ok((Op::Eq, s.to_string()))
+        Ok((Op::Eq, input.to_string()))
     }
 }
 
@@ -199,8 +199,8 @@ pub fn parse(input: &str) -> Result<Option<Expr>, String> {
     Ok(Some(expr))
 }
 
-fn escape_sql(s: &str) -> String {
-    s.replace('\'', "\\'")
+fn escape_sql(input: &str) -> String {
+    input.replace('\'', "\\'")
 }
 
 fn clickhouse_field_logs(key: &str) -> &str {
