@@ -321,46 +321,49 @@ impl Reader {
     }
 }
 
-fn row_to_span(row: &serde_json::Value) -> Span {
-    let duration_ns = row["duration_ns"].as_u64().unwrap_or(0);
-
-    let event_names = row["Events.Name"].as_array().cloned().unwrap_or_default();
-    let event_timestamps = row["Events.Timestamp"]
+fn build_events(row: &serde_json::Value) -> Vec<SpanEvent> {
+    let names = row["Events.Name"].as_array().cloned().unwrap_or_default();
+    let timestamps = row["Events.Timestamp"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let event_attributes = row["Events.Attributes"]
+    let attributes = row["Events.Attributes"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let events = event_names
+    names
         .into_iter()
-        .zip(event_timestamps)
-        .zip(event_attributes)
+        .zip(timestamps)
+        .zip(attributes)
         .map(|((name, ts), attrs)| SpanEvent {
             name: name.as_str().unwrap_or_default().to_string(),
             timestamp: ns_to_rfc3339(ts.as_u64().unwrap_or(0)),
             attributes: attrs,
         })
-        .collect();
+        .collect()
+}
 
-    let link_trace_ids = row["Links.TraceId"].as_array().cloned().unwrap_or_default();
-    let link_span_ids = row["Links.SpanId"].as_array().cloned().unwrap_or_default();
-    let link_attributes = row["Links.Attributes"]
+fn build_links(row: &serde_json::Value) -> Vec<SpanLink> {
+    let trace_ids = row["Links.TraceId"].as_array().cloned().unwrap_or_default();
+    let span_ids = row["Links.SpanId"].as_array().cloned().unwrap_or_default();
+    let attributes = row["Links.Attributes"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let links = link_trace_ids
+    trace_ids
         .into_iter()
-        .zip(link_span_ids)
-        .zip(link_attributes)
+        .zip(span_ids)
+        .zip(attributes)
         .map(|((tid, sid), attrs)| SpanLink {
             trace_id: tid.as_str().unwrap_or_default().to_string(),
             span_id: sid.as_str().unwrap_or_default().to_string(),
             attributes: attrs,
         })
-        .collect();
+        .collect()
+}
 
+fn row_to_span(row: &serde_json::Value) -> Span {
+    let duration_ns = row["duration_ns"].as_u64().unwrap_or(0);
     Span {
         span_id: row["span_id"].as_str().unwrap_or_default().to_string(),
         parent_span_id: row["parent_span_id"]
@@ -377,8 +380,8 @@ fn row_to_span(row: &serde_json::Value) -> Span {
         duration_ms: duration_ns as f64 / 1_000_000.0,
         status_code: row["status_code"].as_i64().unwrap_or(0),
         attributes: parse_attributes(&row["attributes"]),
-        events,
-        links,
+        events: build_events(row),
+        links: build_links(row),
     }
 }
 
@@ -420,10 +423,11 @@ fn parse_attributes(val: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+const STEP_LADDER: &[u64] = &[60, 300, 900, 3600, 21600, 86400];
+
 fn auto_step(range_secs: u64) -> u64 {
-    const LADDER: &[u64] = &[60, 300, 900, 3600, 21600, 86400];
     let target = range_secs / 30;
-    *LADDER.iter().find(|&&s| s >= target).unwrap_or(&86400)
+    *STEP_LADDER.iter().find(|&&s| s >= target).unwrap_or(&86400)
 }
 
 fn range_secs(from: Option<&str>, to: Option<&str>) -> Result<u64> {

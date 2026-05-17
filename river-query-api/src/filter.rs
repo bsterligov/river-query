@@ -497,4 +497,18 @@ mod tests {
         let sql = to_clickhouse_logs(&expr).unwrap();
         assert!(sql.contains("\\'"));
     }
+
+    #[test]
+    fn trace_id_single_quote_is_escaped_in_sql() {
+        let expr = parse("trace_id:abc'def").unwrap().unwrap();
+        let sql = to_clickhouse_traces(&expr).unwrap();
+        assert!(
+            sql.contains("\\'"),
+            "single-quote must be escaped in SQL; got: {sql}"
+        );
+        assert!(
+            !sql.contains("abc'def"),
+            "raw single-quote must not appear in SQL; got: {sql}"
+        );
+    }
 }
