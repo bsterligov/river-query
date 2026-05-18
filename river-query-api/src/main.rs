@@ -299,6 +299,36 @@ async fn get_logs_facets(
 
 #[utoipa::path(
     get,
+    path = "/v1/traces/facets",
+    params(
+        ("filter" = Option<String>, Query, description = "Filter expression"),
+        ("from" = Option<String>, Query, description = "Start time (RFC 3339)"),
+        ("to" = Option<String>, Query, description = "End time (RFC 3339)"),
+    ),
+    responses(
+        (status = 200, description = "Top values per facet field", body = Vec<clickhouse::FacetField>),
+        (status = 400, description = "Invalid filter or timestamp", body = ErrorBody),
+        (status = 503, description = "ClickHouse unavailable", body = ErrorBody),
+    )
+)]
+async fn get_traces_facets(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<FacetsParams>,
+) -> Result<Json<Vec<clickhouse::FacetField>>, ApiError> {
+    state
+        .ch
+        .query_traces_facets(
+            params.filter.as_deref(),
+            params.from.as_deref(),
+            params.to.as_deref(),
+        )
+        .await
+        .map(Json)
+        .map_err(map_backend_error)
+}
+
+#[utoipa::path(
+    get,
     path = "/v1/traces/{trace_id}",
     params(
         ("trace_id" = String, Path, description = "Trace ID to retrieve"),
@@ -344,6 +374,7 @@ async fn get_health() -> StatusCode {
         get_logs_histogram,
         get_logs_facets,
         get_traces,
+        get_traces_facets,
         get_trace,
         get_metrics,
         get_metric_names,
@@ -370,6 +401,7 @@ fn build_router(state: Arc<AppState>) -> axum::Router {
         .routes(utoipa_axum::routes!(get_logs_histogram))
         .routes(utoipa_axum::routes!(get_logs_facets))
         .routes(utoipa_axum::routes!(get_traces))
+        .routes(utoipa_axum::routes!(get_traces_facets))
         .routes(utoipa_axum::routes!(get_trace))
         .routes(utoipa_axum::routes!(get_metrics))
         .routes(utoipa_axum::routes!(get_metric_names))
@@ -707,6 +739,29 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/v1/logs/facets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let val = body_json(resp).await;
+        assert!(val.is_array());
+        assert!(val[0]["field"].as_str().is_some());
+        assert!(val[0]["values"].is_array());
+    }
+
+    // Scenario: GET /v1/traces/facets returns facet fields
+    #[tokio::test]
+    async fn get_traces_facets_returns_200() {
+        let body = r#"{"value":"payment-service","count":5}"#;
+        let ch = mock_server(200, body).await;
+        let vm = mock_server(200, "").await;
+        let app = build_app(ch.uri(), vm.uri());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/traces/facets")
                     .body(Body::empty())
                     .unwrap(),
             )

@@ -336,6 +336,35 @@ impl Reader {
         Ok(out)
     }
 
+    async fn query_facets(
+        &self,
+        table: &str,
+        fields: &[&str],
+        where_clause: &str,
+    ) -> Vec<FacetField> {
+        let mut result = Vec::with_capacity(fields.len());
+        for &field in fields {
+            let sql = format!(
+                "SELECT {field} AS value, count() AS count \
+                 FROM {table}{where_clause} \
+                 GROUP BY {field} \
+                 ORDER BY count DESC \
+                 LIMIT 20 \
+                 FORMAT JSONEachRow"
+            );
+            let values = self
+                .query_typed::<ChFacetValueRow>(&sql)
+                .await
+                .map(|rows| rows.into_iter().map(FacetValue::from).collect())
+                .unwrap_or_default();
+            result.push(FacetField {
+                field: field.to_string(),
+                values,
+            });
+        }
+        result
+    }
+
     pub async fn query_logs_facets(
         &self,
         filter: Option<&str>,
@@ -344,36 +373,27 @@ impl Reader {
     ) -> Result<Vec<FacetField>> {
         let where_clause =
             build_where_clause(filter, from, to, filter::to_clickhouse_logs, "timestamp")?;
+        Ok(self
+            .query_facets("logs", &["service_name", "severity_text"], &where_clause)
+            .await)
+    }
 
-        let fields = ["service_name", "severity_text"];
-        let mut result = Vec::new();
-
-        for field in fields {
-            let sql = format!(
-                "SELECT {field} AS value, count() AS count \
-                 FROM logs{where_clause} \
-                 GROUP BY {field} \
-                 ORDER BY count DESC \
-                 LIMIT 20 \
-                 FORMAT JSONEachRow"
-            );
-            match self.query_typed::<ChFacetValueRow>(&sql).await {
-                Ok(rows) => {
-                    result.push(FacetField {
-                        field: field.to_string(),
-                        values: rows.into_iter().map(FacetValue::from).collect(),
-                    });
-                }
-                Err(_) => {
-                    result.push(FacetField {
-                        field: field.to_string(),
-                        values: vec![],
-                    });
-                }
-            }
-        }
-
-        Ok(result)
+    pub async fn query_traces_facets(
+        &self,
+        filter: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<FacetField>> {
+        let where_clause = build_where_clause(
+            filter,
+            from,
+            to,
+            filter::to_clickhouse_traces,
+            "start_time_unix_nano",
+        )?;
+        Ok(self
+            .query_facets("traces", &["service_name", "operation_name"], &where_clause)
+            .await)
     }
 
     pub async fn query_traces(
@@ -950,6 +970,33 @@ mod tests {
         let server = get_server(500, "DB error").await;
         let facets = make_reader(server.uri())
             .query_logs_facets(None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(facets.len(), 2);
+        assert!(facets[0].values.is_empty());
+        assert!(facets[1].values.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_traces_facets_returns_fields() {
+        let body = r#"{"value":"payment-service","count":5}"#;
+        let server = get_server(200, body).await;
+        let facets = make_reader(server.uri())
+            .query_traces_facets(None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(facets.len(), 2);
+        assert_eq!(facets[0].field, "service_name");
+        assert!(!facets[0].values.is_empty());
+        assert_eq!(facets[0].values[0].value, "payment-service");
+        assert_eq!(facets[0].values[0].count, 5);
+    }
+
+    #[tokio::test]
+    async fn query_traces_facets_ch_error_returns_empty_values() {
+        let server = get_server(500, "DB error").await;
+        let facets = make_reader(server.uri())
+            .query_traces_facets(None, None, None)
             .await
             .unwrap();
         assert_eq!(facets.len(), 2);
