@@ -2,8 +2,7 @@ FROM rust:1.95-slim-trixie AS builder
 WORKDIR /app
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY infra/migrations ./infra/migrations
+COPY river-query-api ./river-query-api
 RUN cargo build --release --package river-query-api
 
 FROM debian:trixie-slim

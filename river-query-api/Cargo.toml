@@ -7,7 +7,7 @@ edition = "2021"
 workspace = true
 
 [dependencies]
-river-config = { path = "../river-config" }
+river-config = { git = "https://github.com/bsterligov/river-common", tag = "0.1.0" }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
