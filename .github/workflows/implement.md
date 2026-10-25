@@ -21,7 +21,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
-engine: claude
+engine: gemini
 timeout-minutes: 45
 concurrency:
   job-discriminator: ${{ inputs.task }}
