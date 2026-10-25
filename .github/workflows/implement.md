@@ -56,6 +56,8 @@ tools:
   edit:
   bash: true
 safe-outputs:
+  threat-detection:
+    engine: false   # gemini cannot run detection; keep the non-AI checks only
   create-pull-request:
     title-prefix: "[agent] "
     labels: [agent]
